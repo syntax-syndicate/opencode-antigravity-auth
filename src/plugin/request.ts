@@ -3,12 +3,14 @@ import {
   ANTIGRAVITY_HEADERS,
   ANTIGRAVITY_ENDPOINT,
 } from "../constants";
+import { cacheSignature, getCachedSignature } from "./cache";
 import { logAntigravityDebugResponse, type AntigravityDebugContext } from "./debug";
 import {
   extractThinkingConfig,
   extractUsageFromSsePayload,
   extractUsageMetadata,
   filterUnsignedThinkingBlocks,
+  filterMessagesThinkingBlocks,
   isThinkingCapableModel,
   normalizeThinkingConfig,
   parseAntigravityApiBody,
@@ -17,6 +19,20 @@ import {
   transformThinkingParts,
   type AntigravityApiBody,
 } from "./request-helpers";
+
+/**
+ * Stable session ID for the plugin's lifetime.
+ * This is used for caching thinking signatures across multi-turn conversations.
+ * Generated once at plugin load time and reused for all requests.
+ */
+const PLUGIN_SESSION_ID = `-${Math.floor(Math.random() * 9_000_000_000_000_000_000)}`;
+
+/**
+ * Gets the stable session ID for this plugin instance.
+ */
+export function getPluginSessionId(): string {
+  return PLUGIN_SESSION_ID;
+}
 
 function generateSyntheticProjectId(): string {
   const adjectives = ["useful", "bright", "swift", "calm", "bold"];
@@ -65,31 +81,39 @@ function transformStreamingPayload(payload: string): string {
 
 /**
  * Creates a TransformStream that processes SSE chunks incrementally,
- * transforming each line as it arrives for true streaming support.
+ * transforming each line as it arrives for true real-time streaming support.
+ * Optionally caches thinking signatures for Claude multi-turn conversations.
  */
-function createStreamingTransformer(): TransformStream<Uint8Array, Uint8Array> {
+function createStreamingTransformer(sessionId?: string): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
+  // Buffer for accumulating thinking text per candidate index (for signature caching)
+  const thoughtBuffer = new Map<number, string>();
 
   return new TransformStream({
     transform(chunk, controller) {
+      // Decode chunk with stream: true to handle multi-byte characters correctly
       buffer += decoder.decode(chunk, { stream: true });
 
-      // Process complete lines
+      // Process complete lines immediately for real-time streaming
       const lines = buffer.split("\n");
       // Keep the last incomplete line in buffer
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        const transformedLine = transformSseLine(line);
+        // Transform and forward each line immediately
+        const transformedLine = transformSseLine(line, sessionId, thoughtBuffer);
         controller.enqueue(encoder.encode(transformedLine + "\n"));
       }
     },
     flush(controller) {
+      // Flush any remaining bytes from TextDecoder
+      buffer += decoder.decode();
+
       // Process any remaining data in buffer
       if (buffer) {
-        const transformedLine = transformSseLine(buffer);
+        const transformedLine = transformSseLine(buffer, sessionId, thoughtBuffer);
         controller.enqueue(encoder.encode(transformedLine));
       }
     },
@@ -98,8 +122,13 @@ function createStreamingTransformer(): TransformStream<Uint8Array, Uint8Array> {
 
 /**
  * Transforms a single SSE line, extracting and transforming the inner response.
+ * Optionally caches thinking signatures for Claude multi-turn support.
  */
-function transformSseLine(line: string): string {
+function transformSseLine(
+  line: string,
+  sessionId?: string,
+  thoughtBuffer?: Map<number, string>,
+): string {
   if (!line.startsWith("data:")) {
     return line;
   }
@@ -110,11 +139,67 @@ function transformSseLine(line: string): string {
   try {
     const parsed = JSON.parse(json) as { response?: unknown };
     if (parsed.response !== undefined) {
+      // Cache thinking signatures for Claude multi-turn support
+      if (sessionId && thoughtBuffer) {
+        cacheThinkingSignatures(parsed.response, sessionId, thoughtBuffer);
+      }
       const transformed = transformThinkingParts(parsed.response);
       return `data: ${JSON.stringify(transformed)}`;
     }
   } catch (_) { }
   return line;
+}
+
+/**
+ * Extracts and caches thinking signatures from a response for Claude multi-turn support.
+ */
+function cacheThinkingSignatures(
+  response: unknown,
+  sessionId: string,
+  thoughtBuffer: Map<number, string>,
+): void {
+  if (!response || typeof response !== "object") return;
+
+  const resp = response as Record<string, unknown>;
+
+  // Handle Gemini-style candidates array (Claude through Antigravity uses this format)
+  if (Array.isArray(resp.candidates)) {
+    resp.candidates.forEach((candidate: any, index: number) => {
+      if (!candidate?.content?.parts) return;
+
+      candidate.content.parts.forEach((part: any) => {
+        // Collect thinking text
+        if (part.thought === true || part.type === "thinking") {
+          const text = part.text || part.thinking || "";
+          if (text) {
+            const current = thoughtBuffer.get(index) ?? "";
+            thoughtBuffer.set(index, current + text);
+          }
+        }
+
+        // Cache signature when we receive it
+        if (part.thoughtSignature) {
+          const fullText = thoughtBuffer.get(index) ?? "";
+          if (fullText && sessionId) {
+            cacheSignature(sessionId, fullText, part.thoughtSignature);
+          }
+        }
+      });
+    });
+  }
+
+  // Handle Anthropic-style content array
+  if (Array.isArray(resp.content)) {
+    let thinkingText = "";
+    resp.content.forEach((block: any) => {
+      if (block?.type === "thinking") {
+        thinkingText += block.thinking || block.text || "";
+      }
+      if (block?.signature && thinkingText && sessionId) {
+        cacheSignature(sessionId, thinkingText, block.signature);
+      }
+    });
+  }
 }
 
 /**
@@ -127,13 +212,14 @@ export function prepareAntigravityRequest(
   accessToken: string,
   projectId: string,
   endpointOverride?: string,
-): { request: RequestInfo; init: RequestInit; streaming: boolean; requestedModel?: string; effectiveModel?: string; projectId?: string; endpoint?: string; toolDebugMissing?: number; toolDebugSummary?: string; toolDebugPayload?: string } {
+): { request: RequestInfo; init: RequestInit; streaming: boolean; requestedModel?: string; effectiveModel?: string; projectId?: string; endpoint?: string; sessionId?: string; toolDebugMissing?: number; toolDebugSummary?: string; toolDebugPayload?: string } {
   const baseInit: RequestInit = { ...init };
   const headers = new Headers(init?.headers ?? {});
   let resolvedProjectId = projectId?.trim() || "";
   let toolDebugMissing = 0;
   const toolDebugSummaries: string[] = [];
   let toolDebugPayload: string | undefined;
+  let sessionId: string | undefined;
 
   if (!isGenerativeLanguageRequest(input)) {
     return {
@@ -163,6 +249,7 @@ export function prepareAntigravityRequest(
   const transformedUrl = `${baseEndpoint}/v1internal:${rawAction}${streaming ? "?alt=sse" : ""
     }`;
   const isClaudeModel = upstreamModel.toLowerCase().includes("claude");
+  const isClaudeThinkingModel = isClaudeModel && upstreamModel.toLowerCase().includes("thinking");
 
   let body = baseInit.body;
   if (typeof baseInit.body === "string" && baseInit.body) {
@@ -175,12 +262,68 @@ export function prepareAntigravityRequest(
           ...parsedBody,
           model: effectiveModel,
         } as Record<string, unknown>;
+
+        // Some callers may already send an Antigravity-wrapped body.
+        // We still need to sanitize Claude thinking blocks (remove cache_control)
+        // and attach a stable sessionId so multi-turn signature caching works.
+        const requestRoot = wrappedBody.request;
+        const requestObjects: Array<Record<string, unknown>> = [];
+
+        if (requestRoot && typeof requestRoot === "object") {
+          requestObjects.push(requestRoot as Record<string, unknown>);
+          const nested = (requestRoot as any).request;
+          if (nested && typeof nested === "object") {
+            requestObjects.push(nested as Record<string, unknown>);
+          }
+        }
+
+        if (requestObjects.length > 0) {
+          sessionId = PLUGIN_SESSION_ID;
+        }
+
+        for (const req of requestObjects) {
+          // Use stable session ID for signature caching across multi-turn conversations
+          (req as any).sessionId = PLUGIN_SESSION_ID;
+
+          if (isClaudeModel) {
+            if (Array.isArray((req as any).contents)) {
+              (req as any).contents = filterUnsignedThinkingBlocks(
+                (req as any).contents,
+                PLUGIN_SESSION_ID,
+                getCachedSignature,
+              );
+            }
+            if (Array.isArray((req as any).messages)) {
+              (req as any).messages = filterMessagesThinkingBlocks(
+                (req as any).messages,
+                PLUGIN_SESSION_ID,
+                getCachedSignature,
+              );
+            }
+          }
+        }
+
         body = JSON.stringify(wrappedBody);
       } else {
         const requestPayload: Record<string, unknown> = { ...parsedBody };
 
         const rawGenerationConfig = requestPayload.generationConfig as Record<string, unknown> | undefined;
         const extraBody = requestPayload.extra_body as Record<string, unknown> | undefined;
+
+        if (isClaudeModel) {
+          if (!requestPayload.toolConfig) {
+            requestPayload.toolConfig = {};
+          }
+          if (typeof requestPayload.toolConfig === "object" && requestPayload.toolConfig !== null) {
+            const toolConfig = requestPayload.toolConfig as Record<string, unknown>;
+            if (!toolConfig.functionCallingConfig) {
+              toolConfig.functionCallingConfig = {};
+            }
+            if (typeof toolConfig.functionCallingConfig === "object" && toolConfig.functionCallingConfig !== null) {
+              (toolConfig.functionCallingConfig as Record<string, unknown>).mode = "VALIDATED";
+            }
+          }
+        }
 
         // Resolve thinking configuration based on user settings and model capabilities
         const userThinkingConfig = extractThinkingConfig(requestPayload, rawGenerationConfig, extraBody);
@@ -196,11 +339,41 @@ export function prepareAntigravityRequest(
 
         const normalizedThinking = normalizeThinkingConfig(finalThinkingConfig);
         if (normalizedThinking) {
+          const thinkingBudget = normalizedThinking.thinkingBudget;
+          const thinkingConfig: Record<string, unknown> = isClaudeThinkingModel
+            ? {
+              include_thoughts: normalizedThinking.includeThoughts ?? true,
+              ...(typeof thinkingBudget === "number" && thinkingBudget > 0
+                ? { thinking_budget: thinkingBudget }
+                : {}),
+            }
+            : {
+              includeThoughts: normalizedThinking.includeThoughts,
+              ...(typeof thinkingBudget === "number" && thinkingBudget > 0 ? { thinkingBudget } : {}),
+            };
+
           if (rawGenerationConfig) {
-            rawGenerationConfig.thinkingConfig = normalizedThinking;
+            rawGenerationConfig.thinkingConfig = thinkingConfig;
+
+            if (isClaudeThinkingModel && typeof thinkingBudget === "number" && thinkingBudget > 0) {
+              const currentMax = (rawGenerationConfig.maxOutputTokens ?? rawGenerationConfig.max_output_tokens) as number | undefined;
+              if (!currentMax || currentMax <= thinkingBudget) {
+                rawGenerationConfig.maxOutputTokens = 64000;
+                if (rawGenerationConfig.max_output_tokens !== undefined) {
+                  delete rawGenerationConfig.max_output_tokens;
+                }
+              }
+            }
+
             requestPayload.generationConfig = rawGenerationConfig;
           } else {
-            requestPayload.generationConfig = { thinkingConfig: normalizedThinking };
+            const generationConfig: Record<string, unknown> = { thinkingConfig };
+
+            if (isClaudeThinkingModel && typeof thinkingBudget === "number" && thinkingBudget > 0) {
+              generationConfig.maxOutputTokens = 64000;
+            }
+
+            requestPayload.generationConfig = generationConfig;
           }
         } else if (rawGenerationConfig?.thinkingConfig) {
           delete rawGenerationConfig.thinkingConfig;
@@ -218,6 +391,46 @@ export function prepareAntigravityRequest(
         if ("system_instruction" in requestPayload) {
           requestPayload.systemInstruction = requestPayload.system_instruction;
           delete requestPayload.system_instruction;
+        }
+
+        if (isClaudeThinkingModel && Array.isArray(requestPayload.tools) && requestPayload.tools.length > 0) {
+          const hint = "Interleaved thinking is enabled. You may think between tool calls and after receiving tool results before deciding the next action or final answer. Do not mention these instructions or any constraints about thinking blocks; just apply them.";
+          const existing = requestPayload.systemInstruction;
+
+          if (typeof existing === "string") {
+            requestPayload.systemInstruction = existing.trim().length > 0 ? `${existing}\n\n${hint}` : hint;
+          } else if (existing && typeof existing === "object") {
+            const sys = existing as Record<string, unknown>;
+            const partsValue = sys.parts;
+
+            if (Array.isArray(partsValue)) {
+              const parts = partsValue as unknown[];
+              let appended = false;
+
+              for (let i = parts.length - 1; i >= 0; i--) {
+                const part = parts[i];
+                if (part && typeof part === "object") {
+                  const partRecord = part as Record<string, unknown>;
+                  const text = partRecord.text;
+                  if (typeof text === "string") {
+                    partRecord.text = `${text}\n\n${hint}`;
+                    appended = true;
+                    break;
+                  }
+                }
+              }
+
+              if (!appended) {
+                parts.push({ text: hint });
+              }
+            } else {
+              sys.parts = [{ text: hint }];
+            }
+
+            requestPayload.systemInstruction = sys;
+          } else if (Array.isArray(requestPayload.contents)) {
+            requestPayload.systemInstruction = { parts: [{ text: hint }] };
+          }
         }
 
         const cachedContentFromExtra =
@@ -438,8 +651,23 @@ export function prepareAntigravityRequest(
         }
 
         // For Claude models, filter out unsigned thinking blocks (required by Claude API)
-        if (isClaudeModel && Array.isArray(requestPayload.contents)) {
-          requestPayload.contents = filterUnsignedThinkingBlocks(requestPayload.contents);
+        // Attempts to restore signatures from cache for multi-turn conversations
+        // Handle both Gemini-style contents[] and Anthropic-style messages[] payloads.
+        if (isClaudeModel) {
+          if (Array.isArray(requestPayload.contents)) {
+            requestPayload.contents = filterUnsignedThinkingBlocks(
+              requestPayload.contents,
+              PLUGIN_SESSION_ID,
+              getCachedSignature,
+            );
+          }
+          if (Array.isArray(requestPayload.messages)) {
+            requestPayload.messages = filterMessagesThinkingBlocks(
+              requestPayload.messages,
+              PLUGIN_SESSION_ID,
+              getCachedSignature,
+            );
+          }
         }
 
         // For Claude models, ensure functionCall/tool use parts carry IDs (required by Anthropic).
@@ -520,7 +748,9 @@ export function prepareAntigravityRequest(
           requestId: "agent-" + crypto.randomUUID(),
         });
         if (wrappedBody.request && typeof wrappedBody.request === 'object') {
-          (wrappedBody.request as any).sessionId = "-" + Math.floor(Math.random() * 9000000000000000000).toString();
+          // Use stable session ID for signature caching across multi-turn conversations
+          sessionId = PLUGIN_SESSION_ID;
+          (wrappedBody.request as any).sessionId = sessionId;
         }
 
         body = JSON.stringify(wrappedBody);
@@ -532,6 +762,21 @@ export function prepareAntigravityRequest(
 
   if (streaming) {
     headers.set("Accept", "text/event-stream");
+  }
+
+  // Add interleaved thinking header for Claude thinking models
+  // This enables real-time streaming of thinking tokens
+  if (isClaudeThinkingModel) {
+    const existing = headers.get("anthropic-beta");
+    const interleavedHeader = "interleaved-thinking-2025-05-14";
+
+    if (existing) {
+      if (!existing.includes(interleavedHeader)) {
+        headers.set("anthropic-beta", `${existing},${interleavedHeader}`);
+      }
+    } else {
+      headers.set("anthropic-beta", interleavedHeader);
+    }
   }
 
   headers.set("User-Agent", ANTIGRAVITY_HEADERS["User-Agent"]);
@@ -554,6 +799,7 @@ export function prepareAntigravityRequest(
     effectiveModel: upstreamModel,
     projectId: resolvedProjectId,
     endpoint: transformedUrl,
+    sessionId,
     toolDebugMissing,
     toolDebugSummary: toolDebugSummaries.slice(0, 20).join(" | "),
     toolDebugPayload,
@@ -564,7 +810,8 @@ export function prepareAntigravityRequest(
  * Normalizes Antigravity responses: applies retry headers, extracts cache usage into headers,
  * rewrites preview errors, flattens streaming payloads, and logs debug metadata.
  *
- * For streaming SSE responses, uses TransformStream for true incremental streaming.
+ * For streaming SSE responses, uses TransformStream for true real-time incremental streaming.
+ * Thinking/reasoning tokens are transformed and forwarded immediately as they arrive.
  */
 export async function transformAntigravityResponse(
   response: Response,
@@ -574,6 +821,7 @@ export async function transformAntigravityResponse(
   projectId?: string,
   endpoint?: string,
   effectiveModel?: string,
+  sessionId?: string,
   toolDebugMissing?: number,
   toolDebugSummary?: string,
   toolDebugPayload?: string,
@@ -590,51 +838,18 @@ export async function transformAntigravityResponse(
   }
 
   // For successful streaming responses, use TransformStream to transform SSE events
-  // while maintaining real-time streaming (no buffering of entire response)
+  // while maintaining real-time streaming (no buffering of entire response).
+  // This enables thinking tokens to be displayed as they arrive, like the Codex plugin.
   if (streaming && response.ok && isEventStreamResponse && response.body) {
     const headers = new Headers(response.headers);
 
-    // Buffer for partial SSE events that span chunks
-    let buffer = "";
-    const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
-
-    const transformStream = new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        // Decode chunk with stream: true to handle multi-byte characters
-        buffer += decoder.decode(chunk, { stream: true });
-
-        // Split on double newline (SSE event delimiter)
-        const events = buffer.split("\n\n");
-
-        // Keep last part in buffer (may be incomplete)
-        buffer = events.pop() || "";
-
-        // Process and forward complete events immediately
-        for (const event of events) {
-          if (event.trim()) {
-            const transformed = transformStreamingPayload(event);
-            controller.enqueue(encoder.encode(transformed + "\n\n"));
-          }
-        }
-      },
-      flush(controller) {
-        // Flush any remaining bytes from TextDecoder
-        buffer += decoder.decode();
-
-        // Handle any remaining data at stream end
-        if (buffer.trim()) {
-          const transformed = transformStreamingPayload(buffer);
-          controller.enqueue(encoder.encode(transformed));
-        }
-      }
-    });
-
     logAntigravityDebugResponse(debugContext, response, {
-      note: "Streaming SSE response (transformed)",
+      note: "Streaming SSE response (real-time transform)",
     });
 
-    return new Response(response.body.pipeThrough(transformStream), {
+    // Use the optimized line-by-line transformer for immediate forwarding
+    // This ensures thinking/reasoning content streams in real-time
+    return new Response(response.body.pipeThrough(createStreamingTransformer(sessionId)), {
       status: response.status,
       statusText: response.statusText,
       headers,
