@@ -27,7 +27,7 @@ Then create or edit the config file at `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-antigravity-auth@1.1.2"]
+  "plugin": ["opencode-antigravity-auth@1.1.3"]
 }
 ```
 
@@ -59,7 +59,7 @@ Open the **same config file** you created in Step 1 (`~/.config/opencode/opencod
 
 ```json
 {
-  "plugin": ["opencode-antigravity-auth@1.1.2"],
+  "plugin": ["opencode-antigravity-auth@1.1.3"],
   "provider": {
     "google": {
       "models": {
@@ -79,6 +79,17 @@ Open the **same config file** you created in Step 1 (`~/.config/opencode/opencod
           "limit": {
             "context": 1048576,
             "output": 65535
+          },
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          }
+        },
+        "gemini-3-flash": {
+          "name": "Gemini 3 Flash (Antigravity)",
+          "limit": {
+            "context": 1048576,
+            "output": 65536
           },
           "modalities": {
             "input": ["text", "image", "pdf"],
