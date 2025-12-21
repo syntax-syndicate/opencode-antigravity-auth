@@ -168,11 +168,23 @@ The plugin supports multiple Google accounts to maximize rate limits and provide
 
 ### How it works
 
-- **Round-robin selection:** Each request uses the next account in the pool
-- **Automatic failover:** On HTTP `429` (rate limit), the plugin automatically switches to the next available account
-- **Smart cooldown:** Rate-limited accounts are temporarily cooled down and automatically become available again after the cooldown expires
-- **Single-account retry:** If you only have one account, the plugin waits for the rate limit to reset and retries automatically
-- **Toast notifications:** The TUI shows which account is being used and when switching occurs
+- **Sticky account selection:** The plugin sticks to the same account for all requests until it hits a rate limit. This preserves Anthropic's prompt cache, which is organization-scoped.
+- **Per-model-family rate limits:** Rate limits are tracked separately for Claude and Gemini models. If an account is rate-limited for Claude, it can still be used for Gemini requests.
+- **Smart retry threshold:** Short rate limits (≤5s) are retried on the same account to avoid unnecessary switching.
+- **Exponential backoff:** Consecutive rate limits trigger exponential backoff with increasing delays.
+- **Quota-aware messages:** Rate limit toasts show quota reset times when available from the API.
+- **Automatic failover:** On HTTP `429` (rate limit), the plugin automatically switches to the next available account for that model family.
+- **Smart cooldown:** Rate-limited accounts are temporarily cooled down and automatically become available again after the cooldown expires.
+- **Single-account retry:** If you only have one account, the plugin waits for the rate limit to reset and retries automatically.
+- **Debounced notifications:** Toast notifications are debounced to avoid spam during streaming responses.
+
+### Quiet mode
+
+To suppress account-related toast notifications (useful for streaming/recording):
+
+```bash
+export OPENCODE_ANTIGRAVITY_QUIET=1
+```
 
 ### Adding accounts
 
@@ -231,13 +243,17 @@ For models like `claude-opus-4-5-thinking`:
 
 ## Debugging
 
-Enable verbose logging:
+Enable debug logging via environment variable:
 
 ```bash
 export OPENCODE_ANTIGRAVITY_DEBUG=1
 ```
 
-Logs are written to the current directory (e.g., `antigravity-debug-<timestamp>.log`).
+- **Level 1 (`1` or `true`):** Basic logging of URLs, headers, status codes, and request/response previews.
+- **Level 2 (`2` or `verbose`):** Verbose logging including full request and response bodies (up to 50KB).
+- **TUI Reasoning View:** Debug logs are injected into the model's "thinking/reasoning" blocks in the Opencode TUI (requires thinking-capable models).
+- **Log Files:** Logs are written to `antigravity-debug-<timestamp>.log` in the current directory.
+- **Auto-Stripping:** Injected debug blocks are automatically stripped from outgoing requests to prevent leaking into conversation history.
 
 ## Development
 

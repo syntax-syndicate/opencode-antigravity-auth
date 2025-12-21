@@ -2,7 +2,14 @@ import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
-export interface AccountMetadata {
+export type ModelFamily = "claude" | "gemini";
+
+export interface RateLimitState {
+  claude?: number;
+  gemini?: number;
+}
+
+export interface AccountMetadataV1 {
   email?: string;
   refreshToken: string;
   projectId?: string;
@@ -11,18 +18,33 @@ export interface AccountMetadata {
   lastUsed: number;
   isRateLimited?: boolean;
   rateLimitResetTime?: number;
+  lastSwitchReason?: "rate-limit" | "initial" | "rotation";
+}
+
+export interface AccountStorageV1 {
+  version: 1;
+  accounts: AccountMetadataV1[];
+  activeIndex: number;
+}
+
+export interface AccountMetadata {
+  email?: string;
+  refreshToken: string;
+  projectId?: string;
+  managedProjectId?: string;
+  addedAt: number;
+  lastUsed: number;
+  lastSwitchReason?: "rate-limit" | "initial" | "rotation";
+  rateLimitResetTimes?: RateLimitState;
 }
 
 export interface AccountStorage {
-  version: 1;
+  version: 2;
   accounts: AccountMetadata[];
-  /**
-   * Rotation cursor (next index to start from).
-   *
-   * Historical note: some forks call this `activeIndex`.
-   */
   activeIndex: number;
 }
+
+type AnyAccountStorage = AccountStorageV1 | AccountStorage;
 
 function getConfigDir(): string {
   const platform = process.platform;
@@ -38,24 +60,65 @@ export function getStoragePath(): string {
   return join(getConfigDir(), "antigravity-accounts.json");
 }
 
+function migrateV1ToV2(v1: AccountStorageV1): AccountStorage {
+  return {
+    version: 2,
+    accounts: v1.accounts.map((acc) => {
+      const rateLimitResetTimes: RateLimitState = {};
+      if (acc.isRateLimited && acc.rateLimitResetTime && acc.rateLimitResetTime > Date.now()) {
+        rateLimitResetTimes.claude = acc.rateLimitResetTime;
+        rateLimitResetTimes.gemini = acc.rateLimitResetTime;
+      }
+      return {
+        email: acc.email,
+        refreshToken: acc.refreshToken,
+        projectId: acc.projectId,
+        managedProjectId: acc.managedProjectId,
+        addedAt: acc.addedAt,
+        lastUsed: acc.lastUsed,
+        lastSwitchReason: acc.lastSwitchReason,
+        rateLimitResetTimes: Object.keys(rateLimitResetTimes).length > 0 ? rateLimitResetTimes : undefined,
+      };
+    }),
+    activeIndex: v1.activeIndex,
+  };
+}
+
 export async function loadAccounts(): Promise<AccountStorage | null> {
   try {
     const path = getStoragePath();
     const content = await fs.readFile(path, "utf-8");
-    const parsed = JSON.parse(content) as Partial<AccountStorage>;
+    const data = JSON.parse(content) as AnyAccountStorage;
 
-    if (parsed.version !== 1 || !Array.isArray(parsed.accounts)) {
-      console.warn("[opencode-antigravity-auth] Invalid account storage format, ignoring");
+    if (!Array.isArray(data.accounts)) {
+      console.warn("[opencode-antigravity-auth] Invalid storage format, ignoring");
       return null;
     }
 
-    return {
-      version: 1,
-      accounts: parsed.accounts.filter((a): a is AccountMetadata => {
-        return !!a && typeof a === "object" && typeof (a as AccountMetadata).refreshToken === "string";
-      }),
-      activeIndex: typeof parsed.activeIndex === "number" && Number.isFinite(parsed.activeIndex) ? parsed.activeIndex : 0,
-    };
+    let storage: AccountStorage;
+
+    if (data.version === 1) {
+      console.info("[opencode-antigravity-auth] Migrating account storage from v1 to v2");
+      storage = migrateV1ToV2(data);
+      await saveAccounts(storage);
+    } else if (data.version === 2) {
+      storage = data;
+    } else {
+      console.warn("[opencode-antigravity-auth] Unknown storage version, ignoring", {
+        version: (data as { version?: unknown }).version,
+      });
+      return null;
+    }
+
+    if (typeof storage.activeIndex !== "number" || !Number.isInteger(storage.activeIndex)) {
+      storage.activeIndex = 0;
+    }
+
+    if (storage.activeIndex < 0 || storage.activeIndex >= storage.accounts.length) {
+      storage.activeIndex = 0;
+    }
+
+    return storage;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
