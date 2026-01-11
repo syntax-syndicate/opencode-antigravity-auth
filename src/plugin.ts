@@ -48,7 +48,7 @@ import type {
   Provider,
 } from "./plugin/types";
 
-const MAX_OAUTH_ACCOUNTS = 10;
+const MAX_OAUTH_ACCOUNTS = 100;
 const MAX_WARMUP_SESSIONS = 1000;
 const MAX_WARMUP_RETRIES = 2;
 const CAPACITY_BACKOFF_TIERS_MS = [5000, 10000, 20000, 30000, 60000];
