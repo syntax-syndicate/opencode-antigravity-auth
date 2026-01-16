@@ -66,16 +66,11 @@ Install the opencode-antigravity-auth plugin and add the Antigravity model defin
 
 ### Step-by-Step Instructions
 
-1. Edit the OpenCode configuration file:
-   - Linux/Mac: `~/.config/opencode/opencode.json`
-   - Windows: `%APPDATA%\opencode\opencode.json`
+1. Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`
+   
+   > **Note**: This path works on all platforms. On Windows, `~` resolves to your user home directory (e.g., `C:\Users\YourName`).
 
-2. Add the plugin to the `plugins` array:
-   ```json
-   {
-     "plugin": ["opencode-antigravity-auth@latest"]
-   }
-   ```
+2. Add the plugin to the `plugin` array
 
 3. Add the model definitions from the [Full models configuration](#models) section
 
@@ -214,6 +209,268 @@ Add multiple Google accounts for higher combined quotas. The plugin automaticall
 opencode auth login  # Run again to add more accounts
 ```
 
+</details>
+
+## Troubleshoot
+
+> **Quick Reset**: Most issues can be resolved by deleting `~/.config/opencode/antigravity-accounts.json` and running `opencode auth login` again.
+
+### Configuration Path (All Platforms)
+
+OpenCode uses `~/.config/opencode/` on **all platforms** including Windows.
+
+| File | Path |
+|------|------|
+| Main config | `~/.config/opencode/opencode.json` |
+| Accounts | `~/.config/opencode/antigravity-accounts.json` |
+| Plugin config | `~/.config/opencode/antigravity.json` |
+| Debug logs | `~/.config/opencode/antigravity-logs/` |
+
+> **Windows users**: `~` resolves to your user home directory (e.g., `C:\Users\YourName`). Do NOT use `%APPDATA%`.
+
+---
+
+### Multi-Account Auth Issues
+
+If you encounter authentication issues with multiple accounts:
+
+1. Delete the accounts file:
+   ```bash
+   rm ~/.config/opencode/antigravity-accounts.json
+   ```
+2. Re-authenticate:
+   ```bash
+   opencode auth login
+   ```
+
+---
+
+### 403 Permission Denied (`rising-fact-p41fc`)
+
+**Error:**
+```
+Permission 'cloudaicompanion.companions.generateChat' denied on resource 
+'//cloudaicompanion.googleapis.com/projects/rising-fact-p41fc/locations/global'
+```
+
+**Cause:** Plugin falls back to a default project ID when no valid project is found. This works for Antigravity but fails for Gemini CLI models.
+
+**Solution:**
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create or select a project
+3. Enable the **Gemini for Google Cloud API** (`cloudaicompanion.googleapis.com`)
+4. Add `projectId` to your accounts file:
+   ```json
+   {
+     "accounts": [
+       {
+         "email": "your@email.com",
+         "refreshToken": "...",
+         "projectId": "your-project-id"
+       }
+     ]
+   }
+   ```
+
+> **Note**: Do this for each account in a multi-account setup.
+
+---
+
+### Gemini Model Not Found
+
+Add this to your `google` provider config:
+
+```json
+{
+  "provider": {
+    "google": {
+      "npm": "@ai-sdk/google",
+      "models": { ... }
+    }
+  }
+}
+```
+
+---
+
+### Gemini 3 Models 400 Error ("Unknown name 'parameters'")
+
+**Error:**
+```
+Invalid JSON payload received. Unknown name "parameters" at 'request.tools[0]'
+```
+
+**Causes:**
+- Tool schema incompatibility with Gemini's strict protobuf validation
+- MCP servers with malformed schemas
+- Plugin version regression
+
+**Solutions:**
+1. **Update to latest beta:**
+   ```json
+   { "plugin": ["opencode-antigravity-auth@beta"] }
+   ```
+
+2. **Disable MCP servers** one-by-one to find the problematic one
+
+3. **Add npm override:**
+   ```json
+   { "provider": { "google": { "npm": "@ai-sdk/google" } } }
+   ```
+
+---
+
+### MCP Servers Causing Errors
+
+Some MCP servers have schemas incompatible with Antigravity's strict JSON format.
+
+**Diagnosis:**
+1. Disable all MCP servers in your config
+2. Enable one-by-one until error reappears
+3. Report the specific MCP in a [GitHub issue](https://github.com/NoeFabris/opencode-antigravity-auth/issues)
+
+---
+
+### "All Accounts Rate-Limited" (But Quota Available)
+
+**Cause:** Cascade bug in `clearExpiredRateLimits()` in hybrid mode (fixed in recent beta).
+
+**Solutions:**
+1. Update to latest beta version
+2. If persists, delete accounts file and re-authenticate
+3. Try switching `account_selection_strategy` to `"sticky"` in `antigravity.json`
+
+---
+
+### Session Recovery
+
+If you encounter errors during a session:
+1. Type `continue` to trigger the recovery mechanism
+2. If blocked, use `/undo` to revert to pre-error state
+3. Retry the operation
+
+---
+
+### Using with Oh-My-OpenCode
+
+**Important:** Disable the built-in Google auth to prevent conflicts:
+
+```json
+// ~/.config/opencode/oh-my-opencode.json
+{
+  "google_auth": false,
+  "agents": {
+    "frontend-ui-ux-engineer": { "model": "google/antigravity-gemini-3-pro" },
+    "document-writer": { "model": "google/antigravity-gemini-3-flash" }
+  }
+}
+```
+
+---
+
+### Infinite `.tmp` Files Created
+
+**Cause:** When account is rate-limited and plugin retries infinitely, it creates many temp files.
+
+**Workaround:**
+1. Stop OpenCode
+2. Clean up: `rm ~/.config/opencode/*.tmp`
+3. Add more accounts or wait for rate limit to expire
+
+---
+
+### OAuth Callback Issues
+
+<details>
+<summary><b>Safari OAuth Callback Fails (macOS)</b></summary>
+
+**Symptoms:**
+- "fail to authorize" after successful Google login
+- Safari shows "Safari can't open the page"
+
+**Cause:** Safari's "HTTPS-Only Mode" blocks `http://localhost` callback.
+
+**Solutions:**
+
+1. **Use Chrome or Firefox** (easiest):
+   Copy the OAuth URL and paste into a different browser.
+
+2. **Disable HTTPS-Only Mode temporarily:**
+   - Safari > Settings (⌘,) > Privacy
+   - Uncheck "Enable HTTPS-Only Mode"
+   - Run `opencode auth login`
+   - Re-enable after authentication
+
+</details>
+
+<details>
+<summary><b>Port Conflict (Address Already in Use)</b></summary>
+
+**macOS / Linux:**
+```bash
+# Find process using the port
+lsof -i :51121
+
+# Kill if stale
+kill -9 <PID>
+
+# Retry
+opencode auth login
+```
+
+**Windows (PowerShell):**
+```powershell
+netstat -ano | findstr :51121
+taskkill /PID <PID> /F
+opencode auth login
+```
+
+</details>
+
+<details>
+<summary><b>Docker / WSL2 / Remote Development</b></summary>
+
+OAuth callback requires browser to reach `localhost` on the machine running OpenCode.
+
+**WSL2:**
+- Use VS Code's port forwarding, or
+- Configure Windows → WSL port forwarding
+
+**SSH / Remote:**
+```bash
+ssh -L 51121:localhost:51121 user@remote
+```
+
+**Docker / Containers:**
+- OAuth with localhost redirect doesn't work in containers
+- Wait 30s for manual URL flow, or use SSH port forwarding
+
+</details>
+
+---
+
+### Configuration Key Typo: `plugin` not `plugins`
+
+The correct key is `plugin` (singular):
+
+```json
+{
+  "plugin": ["opencode-antigravity-auth@beta"]
+}
+```
+
+**Not** `"plugins"` (will cause "Unrecognized key" error).
+
+---
+
+### Migrating Accounts Between Machines
+
+When copying `antigravity-accounts.json` to a new machine:
+1. Ensure the plugin is installed: `"plugin": ["opencode-antigravity-auth@beta"]`
+2. Copy `~/.config/opencode/antigravity-accounts.json`
+3. If you get "API key missing" error, the refresh token may be invalid — re-authenticate
+
+## Known Plugin Interactions
 For details on load balancing, dual quota pools, and account storage, see [docs/MULTI-ACCOUNT.md](docs/MULTI-ACCOUNT.md).
 
 ---
