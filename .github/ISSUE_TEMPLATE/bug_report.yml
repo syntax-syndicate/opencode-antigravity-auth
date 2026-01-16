@@ -1,6 +1,5 @@
 name: Bug Report
 description: Report a bug or issue with the plugin
-title: "[BUG] "
 labels: ["bug", "needs-triage"]
 body:
   - type: markdown
@@ -8,7 +7,9 @@ body:
       value: |
         ## Before opening an issue
 
-        Please check the following resources first:
+        **Please write a descriptive title above** (e.g., "Auth fails with invalid_grant after token refresh")
+
+        Check the following resources first:
         - [Troubleshoot section](https://github.com/NoeFabris/opencode-antigravity-auth#troubleshoot) - common issues and solutions
         - [Existing issues](https://github.com/NoeFabris/opencode-antigravity-auth/issues?q=is%3Aissue) - your issue may already be reported
 
