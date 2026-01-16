@@ -122,14 +122,84 @@ Some MCP servers have schemas incompatible with Antigravity's strict JSON format
 
 ---
 
-## "All Accounts Rate-Limited" (But Quota Available)
+## Rate Limits, Shadow Bans, and Hanging Prompts
 
-**Cause:** Cascade bug in `clearExpiredRateLimits()` in hybrid mode (fixed in recent beta).
+**Symptoms:**
+- Prompts hang indefinitely (200 OK in logs but no response)
+- 403 "Permission Denied" errors even with fresh accounts
+- "All accounts rate-limited" but quota looks available
+- New accounts get rate-limited immediately after adding
+
+**Why this happens:**
+
+Google has significantly tightened quota and rate-limit enforcement. This affects ALL users, not just this plugin. Key factors:
+
+1. **Stricter enforcement** — Even when quota "looks available," Google may throttle or soft-ban accounts that trigger their abuse detection
+2. **OpenCode's request pattern** — OpenCode makes more API calls than native apps (tool calls, retries, streaming, multi-turn chains), which triggers limits faster than "normal" usage
+3. **Shadow bans** — Some accounts become effectively unusable for extended periods once flagged, while others continue working normally
+
+> ⚠️ **Important:** Using this plugin may increase the chance of triggering automated abuse/rate-limit protections. The upstream provider can restrict, suspend, or terminate access at their discretion. **USE AT YOUR OWN RISK.**
 
 **Solutions:**
-1. Update to latest beta version
-2. If persists, delete accounts file and re-authenticate
-3. Try switching `account_selection_strategy` to `"sticky"` in `antigravity.json`
+
+<details>
+<summary><b>1. Wait it out (most reliable)</b></summary>
+
+Rate limits typically reset after a few hours. If you're seeing persistent issues:
+- Stop using the affected account for 24-48 hours
+- Use a different account in the meantime
+- Check `rateLimitResetTimes` in your accounts file to see when limits expire
+
+</details>
+
+<details>
+<summary><b>2. "Warm up" accounts in Antigravity IDE (community tip)</b></summary>
+
+Users have reported success with this approach:
+
+1. Open [Antigravity IDE](https://idx.google.com/) directly in your browser
+2. Log in with the affected Google account
+3. Run a few simple prompts (e.g., "Hello", "What's 2+2?")
+4. After 5-10 successful prompts, try using the account with the plugin again
+
+**Why this might work:** Using the account through the "official" interface may reset some internal flags or make the account appear less suspicious.
+
+</details>
+
+<details>
+<summary><b>3. Reduce request volume and burstiness</b></summary>
+
+- Use shorter sessions
+- Avoid parallel/retry-heavy workflows (e.g., spawning many subagents at once)
+- If using oh-my-opencode, consider reducing concurrent agent spawns
+- Set `max_rate_limit_wait_seconds: 0` to fail fast instead of retrying
+
+</details>
+
+<details>
+<summary><b>4. Use Antigravity IDE directly (single account users)</b></summary>
+
+If you only have one account, you'll likely have a better experience using [Antigravity IDE](https://idx.google.com/) directly instead of routing through OpenCode, since OpenCode's request pattern triggers limits faster.
+
+</details>
+
+<details>
+<summary><b>5. Fresh account setup</b></summary>
+
+If adding new accounts:
+1. Delete accounts file: `rm ~/.config/opencode/antigravity-accounts.json`
+2. Re-authenticate: `opencode auth login`
+3. Update to latest beta: `"plugin": ["opencode-antigravity-auth@beta"]`
+4. Consider "warming up" the account in Antigravity IDE first
+
+</details>
+
+**What to report:**
+
+If you're seeing unusual rate limit behavior, please share in a [GitHub issue](https://github.com/NoeFabris/opencode-antigravity-auth/issues):
+- Status codes from debug logs (403, 429, etc.)
+- How long the rate-limit state persists
+- Number of accounts and selection strategy used
 
 ---
 
