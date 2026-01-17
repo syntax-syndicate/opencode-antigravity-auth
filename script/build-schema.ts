@@ -1,16 +1,13 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { zodToJsonSchema } from "zod-to-json-schema";
 import { AntigravityConfigSchema } from "../src/plugin/config/schema.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const outputPath = join(__dirname, "../assets/antigravity.schema.json");
 
-const jsonSchema = zodToJsonSchema(AntigravityConfigSchema as any, {
-  name: "AntigravityConfig",
-  $refStrategy: "none",
-}) as Record<string, unknown>;
+// Use zod v4's built-in toJSONSchema method
+const jsonSchema = AntigravityConfigSchema.toJSONSchema() as Record<string, unknown>;
 
 const envVarDescriptions: Record<string, string> = {
   quiet_mode:
