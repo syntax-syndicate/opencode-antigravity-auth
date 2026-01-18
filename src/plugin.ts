@@ -1652,19 +1652,92 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
             // Check for existing accounts and prompt user for login mode
             let startFresh = true;
+            let refreshAccountIndex: number | undefined;
             const existingStorage = await loadAccounts();
             if (existingStorage && existingStorage.accounts.length > 0) {
-              const existingAccounts = existingStorage.accounts.map((acc, idx) => ({
-                email: acc.email,
-                index: idx,
-              }));
+              const now = Date.now();
+              const existingAccounts = existingStorage.accounts.map((acc, idx) => {
+                let status: 'active' | 'rate-limited' | 'expired' | 'unknown' = 'unknown';
+                
+                const rateLimits = acc.rateLimitResetTimes;
+                if (rateLimits) {
+                  const isRateLimited = Object.values(rateLimits).some(
+                    (resetTime) => typeof resetTime === 'number' && resetTime > now
+                  );
+                  if (isRateLimited) {
+                    status = 'rate-limited';
+                  } else {
+                    status = 'active';
+                  }
+                } else {
+                  status = 'active';
+                }
+
+                if (acc.coolingDownUntil && acc.coolingDownUntil > now) {
+                  status = 'rate-limited';
+                }
+
+                return {
+                  email: acc.email,
+                  index: idx,
+                  addedAt: acc.addedAt,
+                  lastUsed: acc.lastUsed,
+                  status,
+                  isCurrentAccount: idx === (existingStorage.activeIndex ?? 0),
+                };
+              });
               
-              const loginMode = await promptLoginMode(existingAccounts);
-              startFresh = loginMode === "fresh";
+              const menuResult = await promptLoginMode(existingAccounts);
               
-              if (startFresh) {
-                console.log("\nStarting fresh - existing accounts will be replaced.\n");
+              if (menuResult.mode === "cancel") {
+                return {
+                  url: "",
+                  instructions: "Authentication cancelled",
+                  method: "auto",
+                  callback: async () => ({ type: "failed", error: "Authentication cancelled" }),
+                };
+              }
+              
+              if (menuResult.deleteAccountIndex !== undefined) {
+                const updatedAccounts = existingStorage.accounts.filter(
+                  (_, idx) => idx !== menuResult.deleteAccountIndex
+                );
+                await saveAccounts({
+                  version: 3,
+                  accounts: updatedAccounts,
+                  activeIndex: 0,
+                  activeIndexByFamily: { claude: 0, gemini: 0 },
+                });
+                console.log("\nAccount deleted.\n");
+                
+                if (updatedAccounts.length > 0) {
+                  return {
+                    url: "",
+                    instructions: "Account deleted. Please run `opencode auth login` again to continue.",
+                    method: "auto",
+                    callback: async () => ({ type: "failed", error: "Account deleted - please re-run auth" }),
+                  };
+                }
+              }
+
+              if (menuResult.refreshAccountIndex !== undefined) {
+                refreshAccountIndex = menuResult.refreshAccountIndex;
+                const refreshEmail = existingStorage.accounts[refreshAccountIndex]?.email;
+                console.log(`\nRe-authenticating ${refreshEmail || 'account'}...\n`);
+                startFresh = false;
+              }
+              
+              if (menuResult.deleteAll) {
+                await clearAccounts();
+                console.log("\nAll accounts deleted.\n");
+                startFresh = true;
               } else {
+                startFresh = menuResult.mode === "fresh";
+              }
+              
+              if (startFresh && !menuResult.deleteAll) {
+                console.log("\nStarting fresh - existing accounts will be replaced.\n");
+              } else if (!startFresh) {
                 console.log("\nAdding to existing accounts.\n");
               }
             }
@@ -1774,7 +1847,6 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
               accounts.push(result);
 
-              // Show toast for successful account authentication
               try {
                 await client.tui.showToast({
                   body: {
@@ -1783,15 +1855,40 @@ export const createAntigravityPlugin = (providerId: string) => async (
                   },
                 });
               } catch {
-                // TUI may not be available in CLI mode
               }
 
               try {
-                // Use startFresh only on first account, subsequent accounts always append
-                const isFirstAccount = accounts.length === 1;
-                await persistAccountPool([result], isFirstAccount && startFresh);
+                if (refreshAccountIndex !== undefined) {
+                  const currentStorage = await loadAccounts();
+                  if (currentStorage) {
+                    const updatedAccounts = [...currentStorage.accounts];
+                    const parts = parseRefreshParts(result.refresh);
+                    if (parts.refreshToken) {
+                      updatedAccounts[refreshAccountIndex] = {
+                        email: result.email ?? updatedAccounts[refreshAccountIndex]?.email,
+                        refreshToken: parts.refreshToken,
+                        projectId: parts.projectId ?? updatedAccounts[refreshAccountIndex]?.projectId,
+                        managedProjectId: parts.managedProjectId ?? updatedAccounts[refreshAccountIndex]?.managedProjectId,
+                        addedAt: updatedAccounts[refreshAccountIndex]?.addedAt ?? Date.now(),
+                        lastUsed: Date.now(),
+                      };
+                      await saveAccounts({
+                        version: 3,
+                        accounts: updatedAccounts,
+                        activeIndex: currentStorage.activeIndex,
+                        activeIndexByFamily: currentStorage.activeIndexByFamily,
+                      });
+                    }
+                  }
+                } else {
+                  const isFirstAccount = accounts.length === 1;
+                  await persistAccountPool([result], isFirstAccount && startFresh);
+                }
               } catch {
-                // ignore
+              }
+
+              if (refreshAccountIndex !== undefined) {
+                break;
               }
 
               if (accounts.length >= MAX_OAUTH_ACCOUNTS) {
@@ -1825,7 +1922,6 @@ export const createAntigravityPlugin = (providerId: string) => async (
               };
             }
 
-            // Get the actual deduplicated account count from storage
             let actualAccountCount = accounts.length;
             try {
               const finalStorage = await loadAccounts();
@@ -1833,12 +1929,15 @@ export const createAntigravityPlugin = (providerId: string) => async (
                 actualAccountCount = finalStorage.accounts.length;
               }
             } catch {
-              // Fall back to accounts.length if we can't read storage
             }
+
+            const successMessage = refreshAccountIndex !== undefined
+              ? `Token refreshed successfully.`
+              : `Multi-account setup complete (${actualAccountCount} account(s)).`;
 
             return {
               url: "",
-              instructions: `Multi-account setup complete (${actualAccountCount} account(s)).`,
+              instructions: successMessage,
               method: "auto",
               callback: async (): Promise<AntigravityTokenExchangeResult> => primary,
             };
