@@ -67,144 +67,16 @@ jobs:
         with:
           script: |
             const issueNumber = context.payload.inputs?.issue_number || context.issue?.number;
-            const { data: issue } = await github.rest.issues.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: parseInt(issueNumber),
-            });
-            core.setOutput('number', issue.number);
-            core.setOutput('title', issue.title);
-            core.setOutput('body', issue.body || '');
-
-      - name: 'Get open issues for duplicate detection'
-        id: 'get_issues'
-        if: steps.check_labels.outputs.skip != 'true'
-        uses: 'actions/github-script@v7'
-        with:
-          script: |
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              per_page: 50,
-              sort: 'updated',
-              direction: 'desc'
-            });
-            
-            const currentIssueNumber = parseInt('${{ steps.get_issue.outputs.number }}');
-            const otherIssues = issues
-              .filter(i => i.number !== currentIssueNumber && !i.pull_request)
-              .map(i => `#${i.number}: ${i.title}`)
-              .slice(0, 30)
-              .join('\n');
-            
-            core.setOutput('list', otherIssues);
-
-      - name: 'Build triage prompt'
-        id: 'build_prompt'
-        if: steps.check_labels.outputs.skip != 'true'
-        run: |
-          cat << 'EOF' > triage_prompt.txt
-          ## Role
-          You are an expert software engineer and triage specialist for the opencode-antigravity-auth project.
-          Your GOAL is to investigate the issue, identify the root cause, and provide a helpful response.
-
-          ## Capabilities & Constraints
-          - ✅ **INVESTIGATE:** You CAN and SHOULD use tools (grep, read, ls) to explore the codebase.
-          - ⛔️ **STRICTLY READ-ONLY:** You are FORBIDDEN from modifying any file. Do NOT use `write`, `edit`, or `sed`. Do NOT create commits.
-          - ❌ **NO QUESTIONS:** Do NOT ask the user for more info.
-          - 🏁 **MANDATORY:** Your FINAL action MUST be to output the JSON classification object.
-          - ⚠️ **VIOLATION PENALTY:** If you attempt to write code, the workflow will fail immediately.
-
-          ## Operational Mode
-          You are a DIAGNOSTICIAN, not a fixer.
-          1. Read the issue.
-          2. Locate the code.
-          3. Diagnose the problem.
-          4. Output the JSON report.
-          STOP.
-
-          ## Example Interaction (Mental Model)
-          User Issue: "Error 403 in auth.ts"
-          
-          Correct Behavior:
-          1. Agent runs `grep "403" src/auth.ts`
-          2. Agent sees token expiration logic.
-          3. Agent outputs JSON: 
-             {"type_label": "question", "area_label": "area/auth", "suggested_response": "The 403 error indicates..."}
-          
-          Incorrect Behavior (VIOLATION):
-          1. Agent runs `edit src/auth.ts` -> ❌ PENALTY
-          2. Agent asks "Can you share logs?" -> ❌ PENALTY
-
-          **IMPORTANT: Always respond in English, regardless of the language of the issue.**
-          
-          This is an OpenCode plugin that enables OAuth authentication with Googles Antigravity API to access models like Claude Opus 4.5, Claude Sonnet 4.5, and Gemini 3 Pro.
-
-          ## Current Issue to Triage
-          Title: ${{ steps.get_issue.outputs.title }}
-          Body: ${{ steps.get_issue.outputs.body }}
-
-          ## Other Open Issues (check for duplicates)
-          ${{ steps.get_issues.outputs.list }}
-
-          ## Your Deep Knowledge
-
-          ### How the plugin works
-          - Intercepts fetch() calls to generativelanguage.googleapis.com
-          - Transforms requests to Antigravity API format
-          - Handles OAuth token exchange via Google credentials
-          - Supports multi-account rotation on rate limits (429)
-          - Strips Claude thinking blocks from outgoing requests (fixes signature errors)
-          - Recovers interrupted tool sessions with synthetic tool_result blocks
-
-          ### Common issues and solutions
-          1. 403 Forbidden - OAuth token expired. Solution: Re-run gemini auth login
-          2. 429 Too Many Requests - Rate limited. Solution: Add more accounts or wait
-          3. Model not found - Model name incorrect. Check supported models in README
-          4. Signature validation error - Fixed by thinking block stripping. Clear session if persists
-          5. tool_result_missing - Session interrupted. Plugin auto-recovers, retry if needed
-          6. antigravity.json not found - Copy config template from README
-          7. Plugin not loading - Check oh-my-opencode or DCP installation
-
-          ### Configuration files
-          - antigravity.json: Main config (accounts, endpoints)
-          - accounts.json: Multi-account credentials
-
-          ## Available Labels
-
-          ### Type labels (pick exactly one)
-          - bug: Something broken (errors, crashes, unexpected behavior)
-          - enhancement: Feature request or improvement
-          - documentation: Docs unclear/missing/outdated
-          - question: User asking for help
-          - invalid: Spam or off-topic
-
-          ### Area labels (pick exactly one)
-          - area/auth: OAuth, login, tokens, credentials, 403 errors
-          - area/models: Model access, Claude/Gemini specific
-          - area/config: Configuration files, setup
-          - area/compat: Compatibility with OpenCode, DCP
-
-          ## Task
-          1. Investigate the issue using your tools if necessary.
-          2. Select ONE type label and ONE area label.
-          3. Check for DUPLICATES.
-          4. Provide a `suggested_response` that includes your technical findings and guidance.
-
-          ## Output (ONLY valid JSON, no markdown, no code blocks)
-          {"type_label": "bug", "area_label": "area/auth", "duplicate_of": null, "suggested_response": "I investigated the code and found that..."}
-          EOF
+            core.setOutput('number', issueNumber);
 
       - name: 'Run Opencode Triage'
         id: 'opencode_triage'
         if: steps.check_labels.outputs.skip != 'true'
         run: |
-          PROMPT=$(cat triage_prompt.txt)
-          echo "Running Opencode Triage on Pi..."
+          echo "Running Opencode Triage on issue ${{ steps.get_issue.outputs.number }}..."
           
-          # Run CLI with persistent auth
-          OUTPUT=$(opencode run "$PROMPT")
+          # Run CLI with the agent config
+          OUTPUT=$(opencode run --agent triage-bot "Triage issue ${{ steps.get_issue.outputs.number }}")
           
           echo "Opencode Output: $OUTPUT"
           
@@ -252,8 +124,23 @@ jobs:
             const duplicateOf = parsed.duplicate_of;
             const suggestedResponse = parsed.suggested_response;
             
+            // Validate required fields
+            if (!typeLabel || !areaLabel || suggestedResponse === undefined) {
+              core.setFailed(`Invalid JSON structure: missing required fields. Parsed: ${JSON.stringify(parsed)}`);
+              return;
+            }
+            
             const validTypeLabels = ['bug', 'enhancement', 'documentation', 'question', 'invalid'];
             const validAreaLabels = ['area/auth', 'area/models', 'area/config', 'area/compat'];
+            
+            if (!validTypeLabels.includes(typeLabel)) {
+              core.warning(`Invalid type_label: ${typeLabel}`);
+              return;
+            }
+            if (!validAreaLabels.includes(areaLabel)) {
+              core.warning(`Invalid area_label: ${areaLabel}`);
+              return;
+            }
             
             const labelsToAdd = [];
             const labelsToRemove = ['needs-triage'];
