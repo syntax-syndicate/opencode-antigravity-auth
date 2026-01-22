@@ -518,7 +518,7 @@ export class AccountManager {
     const now = nowMs();
     
     // TTL-based reset: if last failure was more than failureTtlMs ago, reset count
-    if (account.lastFailureTime && (now - account.lastFailureTime) > failureTtlMs) {
+    if (account.lastFailureTime !== undefined && (now - account.lastFailureTime) > failureTtlMs) {
       account.consecutiveFailures = 0;
     }
     
@@ -853,6 +853,9 @@ export class AccountManager {
       return null;
     }
     
+    // Capture the fingerprint to restore BEFORE modifying history
+    const fingerprintToRestore = history[historyIndex]!.fingerprint;
+    
     // Save current fingerprint to history before restoring (if it exists)
     if (account.fingerprint) {
       const historyEntry: FingerprintVersion = {
@@ -869,9 +872,8 @@ export class AccountManager {
       }
     }
 
-    // Restore the fingerprint from history
-    const restoredFingerprint = history[historyIndex]!.fingerprint;
-    account.fingerprint = { ...restoredFingerprint, createdAt: nowMs() };
+    // Restore the fingerprint
+    account.fingerprint = { ...fingerprintToRestore, createdAt: nowMs() };
     
     this.requestSaveToDisk();
     

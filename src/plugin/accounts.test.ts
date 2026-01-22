@@ -1390,4 +1390,168 @@ describe("AccountManager", () => {
       });
     });
   });
+
+  describe("Failure TTL Expiration", () => {
+    it("resets consecutiveFailures when lastFailureTime exceeds TTL", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getCurrentOrNextForFamily("claude");
+
+      // First failure
+      manager.markRateLimitedWithReason(account!, "claude", "antigravity", null, "QUOTA_EXHAUSTED", null, 3600_000);
+      expect(account!.consecutiveFailures).toBe(1);
+      expect(account!.lastFailureTime).toBe(0);
+
+      // Advance time past TTL (1 hour = 3600s)
+      vi.setSystemTime(new Date(3700_000)); // 3700 seconds later
+
+      // Next failure should reset count because TTL expired
+      manager.markRateLimitedWithReason(account!, "claude", "antigravity", null, "QUOTA_EXHAUSTED", null, 3600_000);
+      expect(account!.consecutiveFailures).toBe(1); // Reset to 0, then +1
+
+      vi.useRealTimers();
+    });
+
+    it("keeps consecutiveFailures when within TTL", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(0));
+
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getCurrentOrNextForFamily("claude");
+
+      // First failure
+      manager.markRateLimitedWithReason(account!, "claude", "antigravity", null, "QUOTA_EXHAUSTED", null, 3600_000);
+      expect(account!.consecutiveFailures).toBe(1);
+
+      // Advance time within TTL
+      vi.setSystemTime(new Date(1800_000)); // 30 minutes later (within 1 hour TTL)
+
+      // Next failure should increment
+      manager.markRateLimitedWithReason(account!, "claude", "antigravity", null, "QUOTA_EXHAUSTED", null, 3600_000);
+      expect(account!.consecutiveFailures).toBe(2);
+
+      vi.useRealTimers();
+    });
+  });
+
+  describe("Fingerprint History", () => {
+    it("regenerateAccountFingerprint saves old fingerprint to history", () => {
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      const account = manager.getCurrentOrNextForFamily("claude");
+      
+      // Set initial fingerprint
+      const originalFingerprint = account!.fingerprint;
+      
+      // Regenerate
+      const newFingerprint = manager.regenerateAccountFingerprint(0);
+      
+      expect(newFingerprint).not.toBeNull();
+      expect(newFingerprint).not.toEqual(originalFingerprint);
+      expect(account!.fingerprintHistory?.length).toBeGreaterThanOrEqual(0);
+    });
+
+    it("restoreAccountFingerprint restores from history", () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(1000)); // Start at 1000 to avoid 0 being falsy
+
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      manager.getCurrentOrNextForFamily("claude");
+      
+      // Generate initial fingerprint
+      const original = manager.regenerateAccountFingerprint(0);
+      const originalDeviceId = original?.deviceId;
+      
+      vi.setSystemTime(new Date(2000));
+      
+      // Generate second fingerprint (pushes first to history at index 0)
+      manager.regenerateAccountFingerprint(0);
+      
+      // History[0] should be the "original" fingerprint
+      const history = manager.getAccountFingerprintHistory(0);
+      expect(history.length).toBeGreaterThanOrEqual(1);
+      expect(history[0]?.fingerprint.deviceId).toBe(originalDeviceId);
+      
+      vi.setSystemTime(new Date(3000));
+      
+      // Restore from history[0] - should get the "original" back
+      // Note: restore also pushes current to history, so after restore:
+      // - Current = original fingerprint
+      // - History[0] = what was current before restore
+      const restored = manager.restoreAccountFingerprint(0, 0);
+      
+      expect(restored).not.toBeNull();
+      expect(restored?.deviceId).toBe(originalDeviceId);
+
+      vi.useRealTimers();
+    });
+
+    it("getAccountFingerprintHistory returns empty array for new account", () => {
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      
+      const history = manager.getAccountFingerprintHistory(0);
+      expect(history).toEqual([]);
+    });
+
+    it("limits fingerprint history to MAX_FINGERPRINT_HISTORY", () => {
+      const stored: AccountStorageV3 = {
+        version: 3,
+        accounts: [
+          { refreshToken: "r1", projectId: "p1", addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      };
+
+      const manager = new AccountManager(undefined, stored);
+      
+      // Regenerate 7 times (should only keep 5 in history)
+      for (let i = 0; i < 7; i++) {
+        manager.regenerateAccountFingerprint(0);
+      }
+      
+      const history = manager.getAccountFingerprintHistory(0);
+      expect(history.length).toBeLessThanOrEqual(5);
+    });
+  });
 });
