@@ -111,7 +111,7 @@ opencode run "Hello" --model=google/antigravity-claude-sonnet-4-5-thinking --var
 
 ### Model Reference
 
-**Antigravity quota** (Claude + Gemini 3):
+**Antigravity quota** (default routing for Claude and Gemini):
 
 | Model | Variants | Notes |
 |-------|----------|-------|
@@ -121,7 +121,7 @@ opencode run "Hello" --model=google/antigravity-claude-sonnet-4-5-thinking --var
 | `antigravity-claude-sonnet-4-5-thinking` | low, max | Claude Sonnet with extended thinking |
 | `antigravity-claude-opus-4-5-thinking` | low, max | Claude Opus with extended thinking |
 
-**Gemini CLI quota** (separate from Antigravity):
+**Gemini CLI quota** (separate from Antigravity; used when `cli_first` is true or as fallback):
 
 | Model | Notes |
 |-------|-------|
@@ -130,7 +130,12 @@ opencode run "Hello" --model=google/antigravity-claude-sonnet-4-5-thinking --var
 | `gemini-3-flash-preview` | Gemini 3 Flash (preview) |
 | `gemini-3-pro-preview` | Gemini 3 Pro (preview) |
 
-> **Quota Behavior:** The plugin tries Antigravity quota first across ALL accounts. Only when Antigravity is exhausted on all accounts does it fall back to Gemini CLI quota. Model names are automatically transformed for the target API (e.g., `antigravity-gemini-3-flash` → `gemini-3-flash-preview` for CLI).
+> **Routing Behavior:**
+> - **Antigravity-first (default):** Gemini models use Antigravity quota across accounts.
+> - **CLI-first (`cli_first: true`):** Gemini models use Gemini CLI quota first.
+> - With `quota_fallback` enabled, the plugin can spill to the other quota when all accounts are exhausted.
+> - Claude and image models always use Antigravity.
+> Model names are automatically transformed for the target API (e.g., `antigravity-gemini-3-flash` → `gemini-3-flash-preview` for CLI).
 
 **Using variants:**
 ```bash
@@ -578,6 +583,7 @@ Most users don't need to configure anything — defaults work well.
 |--------|---------|--------------
 | `keep_thinking` | `false` | Preserve Claude's thinking across turns. **Warning:** enabling may degrade model stability. |
 | `session_recovery` | `true` | Auto-recover from tool errors |
+| `cli_first` | `false` | Route Gemini models to Gemini CLI first (Claude and image models stay on Antigravity). |
 
 ### Account Rotation
 
